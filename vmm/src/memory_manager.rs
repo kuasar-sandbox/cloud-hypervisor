@@ -282,6 +282,22 @@ pub enum Error {
     #[error("No memory zones found")]
     MissingMemoryZones,
 
+    /// Failed to connect to the uffd handler UDS.
+    #[error("Failed to connect uffd handler at {0:?}")]
+    UffdSocketConnect(PathBuf, #[source] io::Error),
+
+    /// Failed sending or receiving on the uffd handler UDS.
+    #[error("uffd handler UDS I/O error")]
+    UffdSocketIo(#[source] io::Error),
+
+    /// uffd handler returned an unexpected response.
+    #[error("uffd handler returned bad response: {0}")]
+    UffdSocketBadResp(String),
+
+    /// UFFDIO_REGISTER ioctl on the inherited uffd failed.
+    #[error("UFFDIO_REGISTER failed")]
+    UffdRegister(#[source] io::Error),
+
     /// Memory configuration is not valid.
     #[error("Memory configuration is not valid")]
     InvalidMemoryParameters,
@@ -650,6 +666,20 @@ impl MemoryManager {
                     thp,
                 )?;
 
+                // If the zone is wired up with an external uffd handler,
+                // create a uffd in this process, register MISSING on the
+                // resulting VA, then send the va_report (with uffd fd
+                // attached via SCM_RIGHTS) and wait for ack before any
+                // vCPU can run.
+                if let Some(socket) = &zone.uffd_socket {
+                    Self::report_va_and_register_uffd(
+                        region.as_ptr() as u64,
+                        region.len() as usize,
+                        socket,
+                        &zone.id,
+                    )?;
+                }
+
                 // Add region to the list of regions associated with the
                 // current memory zone.
                 if let Some(memory_zone) = memory_zones.get_mut(&zone.id) {
@@ -773,6 +803,17 @@ impl MemoryManager {
                         existing_memory_file,
                         thp,
                     )?;
+
+                    // Same uffd plumbing as cold-start. Snapshot restore
+                    // never runs vCPUs without the handler attached.
+                    if let Some(socket) = &zone_config.uffd_socket {
+                        Self::report_va_and_register_uffd(
+                            region.as_ptr() as u64,
+                            region.len() as usize,
+                            socket,
+                            &zone_config.id,
+                        )?;
+                    }
                     memory_regions.push(Arc::clone(&region));
                     if let Some(memory_zone) = memory_zones.get_mut(&guest_ram_mapping.zone_id) {
                         if guest_ram_mapping.virtio_mem {
@@ -1395,6 +1436,207 @@ impl MemoryManager {
         } else {
             Ok(())
         }
+    }
+
+    /// CH-side uffd handshake. Creates a userfaultfd in CH's process
+    /// (mm-bound to CH so faults on chVA route correctly), registers
+    /// MISSING on [addr, addr+size), then sends the va_report message
+    /// to the external handler at socket_path with the new uffd_fd
+    /// attached via SCM_RIGHTS. Waits for the handler's ack.
+    ///
+    /// This inversion is required by the kernel's userfaultfd model:
+    /// uffd is bound to the mm of the syscall caller, so an
+    /// inherited-from-parent uffd cannot register VMAs in the child's
+    /// mm. CH creates and CH owns; the handler reads events through
+    /// the inherited fd from CH (kernel routes events by uffd_t, not
+    /// by current process).
+    fn report_va_and_register_uffd(
+        addr: u64,
+        size: usize,
+        socket_path: &std::path::Path,
+        zone_id: &str,
+    ) -> Result<(), Error> {
+        use std::io::IoSlice;
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        use std::os::unix::net::UnixStream;
+
+        // Create the uffd in this (CH) process so its mm matches the
+        // chVA we just mmap'd.
+        let raw = unsafe {
+            libc::syscall(
+                libc::SYS_userfaultfd,
+                (libc::O_CLOEXEC | libc::O_NONBLOCK) as libc::c_int,
+            )
+        };
+        if raw < 0 {
+            return Err(Error::UffdRegister(io::Error::last_os_error()));
+        }
+        let uffd: OwnedFd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+
+        // UFFDIO_API: negotiate features. The handler doesn't need
+        // EXACT_ADDRESS / WP / MINOR; MISSING_SHMEM (for our memfd) +
+        // EVENT_REMOVE/UNMAP (for balloon free_page_reporting) is
+        // enough.
+        //
+        // Bit positions match <linux/userfaultfd.h>. CRITICAL: bit 1
+        // is UFFD_FEATURE_EVENT_FORK which requires CAP_SYS_PTRACE —
+        // requesting it makes UFFDIO_API return EPERM for unprivileged
+        // callers. Earlier revisions had MISSING_SHMEM=1<<1 by mistake
+        // and accidentally tripped this check.
+        const UFFD_API: u64 = 0xaa;
+        const UFFDIO_API_IOCTL: libc::c_ulong = 0xc018_aa3f;
+        const UFFD_FEATURE_EVENT_REMOVE: u64 = 1 << 3;
+        const UFFD_FEATURE_MISSING_SHMEM: u64 = 1 << 5;
+        const UFFD_FEATURE_EVENT_UNMAP: u64 = 1 << 6;
+        const UFFD_FEATURE_THREAD_ID: u64 = 1 << 8;
+
+        #[repr(C)]
+        struct UffdioApi {
+            api: u64,
+            features: u64,
+            ioctls: u64,
+        }
+        let mut api_req = UffdioApi {
+            api: UFFD_API,
+            features: UFFD_FEATURE_MISSING_SHMEM
+                | UFFD_FEATURE_EVENT_REMOVE
+                | UFFD_FEATURE_EVENT_UNMAP
+                | UFFD_FEATURE_THREAD_ID,
+            ioctls: 0,
+        };
+        let r = unsafe {
+            libc::ioctl(
+                uffd.as_raw_fd(),
+                UFFDIO_API_IOCTL,
+                &mut api_req as *mut _ as *mut libc::c_void,
+            )
+        };
+        if r < 0 {
+            return Err(Error::UffdRegister(io::Error::last_os_error()));
+        }
+
+        // UFFDIO_REGISTER MISSING on [addr, addr+size) in CH's mm.
+        const UFFDIO_REGISTER: libc::c_ulong = 0xc020_aa00;
+        const UFFDIO_REGISTER_MODE_MISSING: u64 = 1;
+        #[repr(C)]
+        struct UffdioRange {
+            start: u64,
+            len: u64,
+        }
+        #[repr(C)]
+        struct UffdioRegister {
+            range: UffdioRange,
+            mode: u64,
+            ioctls: u64,
+        }
+        let mut reg_req = UffdioRegister {
+            range: UffdioRange {
+                start: addr,
+                len: size as u64,
+            },
+            mode: UFFDIO_REGISTER_MODE_MISSING,
+            ioctls: 0,
+        };
+        let r = unsafe {
+            libc::ioctl(
+                uffd.as_raw_fd(),
+                UFFDIO_REGISTER,
+                &mut reg_req as *mut _ as *mut libc::c_void,
+            )
+        };
+        if r < 0 {
+            return Err(Error::UffdRegister(io::Error::last_os_error()));
+        }
+
+        // Send va_report + uffd fd via SCM_RIGHTS, then read ack.
+        let mut socket = UnixStream::connect(socket_path)
+            .map_err(|e| Error::UffdSocketConnect(socket_path.to_path_buf(), e))?;
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "type":     "va_report",
+            "zone_id":  zone_id,
+            "va_start": addr,
+            "size":     size as u64,
+        }))
+        .map_err(|e| Error::UffdSocketBadResp(e.to_string()))?;
+
+        // Wire format: u32 LE length prefix + JSON; uffd_fd as ancillary
+        // data via SCM_RIGHTS on the same sendmsg call.
+        let len = (body.len() as u32).to_le_bytes();
+        let bufs = [IoSlice::new(&len), IoSlice::new(&body)];
+
+        let fd_to_send = uffd.as_raw_fd();
+        let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) };
+        let mut cmsg_buf = vec![0u8; cmsg_space as usize];
+        let iov = [
+            libc::iovec {
+                iov_base: bufs[0].as_ptr() as *mut libc::c_void,
+                iov_len: bufs[0].len(),
+            },
+            libc::iovec {
+                iov_base: bufs[1].as_ptr() as *mut libc::c_void,
+                iov_len: bufs[1].len(),
+            },
+        ];
+        let mut hdr: libc::msghdr = unsafe { std::mem::zeroed() };
+        hdr.msg_iov = iov.as_ptr() as *mut libc::iovec;
+        hdr.msg_iovlen = iov.len() as _;
+        hdr.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        hdr.msg_controllen = cmsg_buf.len() as _;
+        let cmsg = unsafe { libc::CMSG_FIRSTHDR(&hdr) };
+        unsafe {
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<i32>() as u32) as _;
+            std::ptr::copy_nonoverlapping(
+                &fd_to_send as *const i32,
+                libc::CMSG_DATA(cmsg) as *mut i32,
+                1,
+            );
+        }
+        let r = unsafe { libc::sendmsg(socket.as_raw_fd(), &hdr, 0) };
+        if r < 0 {
+            return Err(Error::UffdSocketIo(io::Error::last_os_error()));
+        }
+
+        // Read ack (no fd attached on response).
+        use std::io::Read;
+        let mut len_buf = [0u8; 4];
+        socket.read_exact(&mut len_buf).map_err(Error::UffdSocketIo)?;
+        let resp_len = u32::from_le_bytes(len_buf) as usize;
+        if resp_len > 64 * 1024 {
+            return Err(Error::UffdSocketBadResp(format!(
+                "response length {resp_len} exceeds 64 KiB cap"
+            )));
+        }
+        let mut resp = vec![0u8; resp_len];
+        socket.read_exact(&mut resp).map_err(Error::UffdSocketIo)?;
+        let parsed: serde_json::Value = serde_json::from_slice(&resp)
+            .map_err(|e| Error::UffdSocketBadResp(e.to_string()))?;
+        match parsed.get("type").and_then(|v| v.as_str()) {
+            Some("ack") => {}
+            Some("error") => {
+                let msg = parsed
+                    .get("msg")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(no msg)");
+                return Err(Error::UffdSocketBadResp(format!("handler error: {msg}")));
+            }
+            other => {
+                return Err(Error::UffdSocketBadResp(format!(
+                    "unexpected response type: {other:?}"
+                )));
+            }
+        }
+
+        // CH retains the uffd alive as long as the OwnedFd lives. We
+        // need to keep it open across this function's return so faults
+        // continue to route. Stash it via mem::forget; it'll be reaped
+        // at process exit. Future cleanup: wire to MemoryManager Drop.
+        std::mem::forget(uffd);
+        // Silence unused-var warning when the socket goes out of scope:
+        drop(socket);
+        Ok(())
     }
 
     fn create_anonymous_file(
