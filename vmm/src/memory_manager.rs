@@ -199,6 +199,10 @@ pub enum Error {
     #[error("Failed to create shared file")]
     SharedFileCreate(#[source] io::Error),
 
+    /// Failed to try_clone() the inherited memfd for a region.
+    #[error("Failed to clone memfd for fd-backed memory region")]
+    MemfdClone(#[source] io::Error),
+
     /// Failed to set shared file length.
     #[error("Failed to set shared file length")]
     SharedFileSetLen(#[source] io::Error),
@@ -545,6 +549,17 @@ impl MemoryManager {
         let mut zone_align_size = memory_zone_get_align_size(zone)?;
         let mut zone_offset = 0u64;
         let mut memory_zones = HashMap::new();
+        // Adopt the inherited memfd for the current zone (if any). For
+        // multi-region zones (e.g. MMIO splits crossing the PCI hole on
+        // x86-64) we try_clone() the fd per region below; the kernel-
+        // side mmap shares the same shmem inode across all clones, so
+        // every region points at the same memory.
+        // SAFETY: fd was inherited via cmd.ExtraFiles by the parent;
+        // CH owns each clone for its MmapRegion lifetime. Mutated below
+        // when iterating to a new zone.
+        let mut zone_fd: Option<File> = zone
+            .fd
+            .map(|raw| unsafe { File::from_raw_fd(raw) });
 
         if !is_aligned(zone.size, zone_align_size) {
             return Err(Error::MisalignedMemorySize);
@@ -595,6 +610,14 @@ impl MemoryManager {
                     region_start.raw_value(),
                     region_size
                 );
+                // try_clone() per region so each MmapRegion owns its
+                // own File handle while sharing the same underlying
+                // inode (multi-region zones, e.g. MMIO splits, all see
+                // the same memory).
+                let existing_memory_file = match zone_fd.as_ref() {
+                    Some(f) => Some(f.try_clone().map_err(Error::MemfdClone)?),
+                    None => None,
+                };
                 let region = MemoryManager::create_ram_region(
                     &zone.file,
                     file_offset,
@@ -605,7 +628,7 @@ impl MemoryManager {
                     zone.hugepages,
                     zone.hugepage_size,
                     zone.host_numa_node,
-                    None,
+                    existing_memory_file,
                     thp,
                 )?;
 
@@ -643,6 +666,11 @@ impl MemoryManager {
                         return Err(Error::DuplicateZoneId);
                     }
                     memory_zones.insert(zone.id.clone(), MemoryZone::default());
+                    // Pick up the new zone's inherited fd (if any). Keep
+                    // the same SAFETY invariant as the initial setup.
+                    zone_fd = zone
+                        .fd
+                        .map(|raw| unsafe { File::from_raw_fd(raw) });
                 }
 
                 if ram_region_consumed {
@@ -668,6 +696,18 @@ impl MemoryManager {
     ) -> Result<(Vec<Arc<GuestRegionMmap>>, MemoryZones), Error> {
         let mut memory_regions = Vec::new();
         let mut memory_zones = HashMap::new();
+        // Adopt each fd-backed zone's inherited fd. Multi-region zones
+        // try_clone() per region below, same pattern as cold-start.
+        let mut zone_fds: HashMap<&str, File> = HashMap::new();
+        for zone_config in zones_config {
+            if let Some(raw) = zone_config.fd {
+                // SAFETY: fd was inherited via cmd.ExtraFiles by the
+                // parent (sandbox-ctl) — same invariant as cold-start.
+                zone_fds.insert(zone_config.id.as_str(), unsafe {
+                    File::from_raw_fd(raw)
+                });
+            }
+        }
 
         for zone_config in zones_config {
             memory_zones.insert(zone_config.id.clone(), MemoryZone::default());
@@ -676,6 +716,16 @@ impl MemoryManager {
         for guest_ram_mapping in guest_ram_mappings {
             for zone_config in zones_config {
                 if guest_ram_mapping.zone_id == zone_config.id {
+                    // CLI-provided zone.fd takes precedence over the
+                    // migration-receive HashMap. try_clone() per region
+                    // for the same shared-inode reason as cold-start.
+                    let existing_memory_file = match zone_fds
+                        .get(zone_config.id.as_str())
+                    {
+                        Some(f) => Some(f.try_clone().map_err(Error::MemfdClone)?),
+                        None => existing_memory_files
+                            .remove(&guest_ram_mapping.slot),
+                    };
                     let region = MemoryManager::create_ram_region(
                         if guest_ram_mapping.virtio_mem {
                             &None
@@ -690,7 +740,7 @@ impl MemoryManager {
                         zone_config.hugepages,
                         zone_config.hugepage_size,
                         zone_config.host_numa_node,
-                        existing_memory_files.remove(&guest_ram_mapping.slot),
+                        existing_memory_file,
                         thp,
                     )?;
                     memory_regions.push(Arc::clone(&region));
@@ -877,6 +927,8 @@ impl MemoryManager {
                 hotplug_size: config.hotplug_size,
                 hotplugged_size: config.hotplugged_size,
                 prefault: config.prefault,
+                fd: None,
+                uffd_socket: None,
             }];
 
             Ok((config.size, zones, allow_mem_hotplug))

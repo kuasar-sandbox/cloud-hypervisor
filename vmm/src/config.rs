@@ -907,7 +907,9 @@ impl MemoryConfig {
                     .add("host_numa_node")
                     .add("hotplug_size")
                     .add("hotplugged_size")
-                    .add("prefault");
+                    .add("prefault")
+                    .add("fd")
+                    .add("uffd_socket");
                 parser.parse(memory_zone).map_err(Error::ParseMemoryZone)?;
 
                 let id = parser.get("id").ok_or(Error::ParseMemoryZoneIdMissing)?;
@@ -948,6 +950,10 @@ impl MemoryConfig {
                     .map_err(Error::ParseMemoryZone)?
                     .unwrap_or(Toggle(false))
                     .0;
+                let fd = parser
+                    .convert::<i32>("fd")
+                    .map_err(Error::ParseMemoryZone)?;
+                let uffd_socket = parser.get("uffd_socket").map(PathBuf::from);
 
                 zones.push(MemoryZoneConfig {
                     id,
@@ -960,6 +966,8 @@ impl MemoryConfig {
                     hotplug_size,
                     hotplugged_size,
                     prefault,
+                    fd,
+                    uffd_socket,
                 });
             }
             Some(zones)

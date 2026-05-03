@@ -159,12 +159,31 @@ pub struct MemoryZoneConfig {
     pub hotplugged_size: Option<u64>,
     #[serde(default)]
     pub prefault: bool,
+    /// Inherited fd for memory backing (e.g. via cmd.ExtraFiles in Go).
+    /// When set, CH skips memfd_create and uses this fd directly via the
+    /// existing_memory_files map for both cold-start and restore. Implies
+    /// the user owns snapshot save/restore externally — `memory_range_table`
+    /// skips this zone's regions, so /vm.snapshot writes no memory-ranges
+    /// for it.
+    #[serde(default)]
+    pub fd: Option<i32>,
+    /// UDS path for the va_report handshake to an external uffd handler.
+    /// When set, CH creates a userfaultfd in this process (mm-bound to
+    /// CH's mm so faults route correctly), registers MISSING on the
+    /// memory zone's mmap, then sends `{type:"va_report", va_start,
+    /// size, zone_id}` to this socket with the uffd_fd attached via
+    /// SCM_RIGHTS. Waits for `{type:"ack"}` before allowing vCPU run.
+    #[serde(default)]
+    pub uffd_socket: Option<PathBuf>,
 }
 
 impl ApplyLandlock for MemoryZoneConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         if let Some(file) = &self.file {
             landlock.add_rule_with_access(file, "rw")?;
+        }
+        if let Some(socket) = &self.uffd_socket {
+            landlock.add_rule_with_access(socket, "rw")?;
         }
         Ok(())
     }
