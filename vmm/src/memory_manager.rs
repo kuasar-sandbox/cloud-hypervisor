@@ -120,6 +120,13 @@ impl VirtioMemZone {
 pub struct MemoryZone {
     regions: Vec<Arc<GuestRegionMmap>>,
     virtio_mem_zone: Option<VirtioMemZone>,
+    /// Set when this zone was created with `MemoryZoneConfig.fd` — i.e.
+    /// the user holds an external reference to the same backing inode and
+    /// will save/restore its contents themselves. memory_range_table skips
+    /// such zones from snapshot dump (semantically equivalent to the
+    /// existing hardlink-shared-file fast path, which a memfd cannot
+    /// satisfy because st_nlink == 0).
+    user_managed: bool,
 }
 
 impl MemoryZone {
@@ -131,6 +138,9 @@ impl MemoryZone {
     }
     pub fn virtio_mem_zone_mut(&mut self) -> Option<&mut VirtioMemZone> {
         self.virtio_mem_zone.as_mut()
+    }
+    pub fn user_managed(&self) -> bool {
+        self.user_managed
     }
 }
 
@@ -565,8 +575,16 @@ impl MemoryManager {
             return Err(Error::MisalignedMemorySize);
         }
 
-        // Add zone id to the list of memory zones.
-        memory_zones.insert(zone.id.clone(), MemoryZone::default());
+        // Add zone id to the list of memory zones. user_managed reflects
+        // whether the zone was constructed from an inherited fd (which
+        // implies external save/restore — see MemoryZone docs).
+        memory_zones.insert(
+            zone.id.clone(),
+            MemoryZone {
+                user_managed: zone.fd.is_some(),
+                ..Default::default()
+            },
+        );
 
         for ram_region in ram_regions.iter() {
             let mut ram_region_offset = 0;
@@ -665,7 +683,13 @@ impl MemoryManager {
                         );
                         return Err(Error::DuplicateZoneId);
                     }
-                    memory_zones.insert(zone.id.clone(), MemoryZone::default());
+                    memory_zones.insert(
+                        zone.id.clone(),
+                        MemoryZone {
+                            user_managed: zone.fd.is_some(),
+                            ..Default::default()
+                        },
+                    );
                     // Pick up the new zone's inherited fd (if any). Keep
                     // the same SAFETY invariant as the initial setup.
                     zone_fd = zone
@@ -710,7 +734,13 @@ impl MemoryManager {
         }
 
         for zone_config in zones_config {
-            memory_zones.insert(zone_config.id.clone(), MemoryZone::default());
+            memory_zones.insert(
+                zone_config.id.clone(),
+                MemoryZone {
+                    user_managed: zone_config.fd.is_some(),
+                    ..Default::default()
+                },
+            );
         }
 
         for guest_ram_mapping in guest_ram_mappings {
@@ -2059,6 +2089,14 @@ impl MemoryManager {
         for memory_zone in self.memory_zones.values() {
             if let Some(virtio_mem_zone) = memory_zone.virtio_mem_zone() {
                 table.extend(virtio_mem_zone.plugged_ranges());
+            }
+
+            // user_managed zones are saved/restored externally by the
+            // process that supplied the backing fd (see MemoryZone docs).
+            // Skip them en bloc — Transportable::send writes nothing for
+            // these regions, fill_saved_regions has nothing to load.
+            if snapshot && memory_zone.user_managed() {
+                continue;
             }
 
             for region in memory_zone.regions() {
