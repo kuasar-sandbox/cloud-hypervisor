@@ -93,7 +93,14 @@ fn create_virtio_mem_ioctl_seccomp_rule() -> Vec<SeccompRule> {
 }
 
 fn virtio_balloon_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
-    vec![(libc::SYS_fallocate, vec![])]
+    vec![
+        (libc::SYS_fallocate, vec![]),
+        // release_memory_range probes the memfd with lseek(SEEK_DATA) to
+        // skip PUNCH_HOLE/MADV_DONTNEED on already-sparse runs (see the
+        // balloon device in this crate). Without this allowlist entry the
+        // balloon thread is SIGSYS-killed on the first probe.
+        (libc::SYS_lseek, vec![]),
+    ]
 }
 
 fn virtio_block_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {

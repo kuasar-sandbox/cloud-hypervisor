@@ -200,13 +200,48 @@ impl BalloonEpollHandler {
             GuestMemoryError::InvalidGuestAddress(range_base),
         ))?;
         if let Some(f_off) = region.file_offset() {
-            let offset = range_base.0 - region.start_addr().0;
+            let fd = f_off.file().as_raw_fd();
+            let foff =
+                (range_base.0 - region.start_addr().0 + f_off.start()) as libc::off64_t;
+            let end = foff + range_len as libc::off64_t;
+
+            // The guest balloon hands back pages it never wrote: balloon
+            // allocations carry no __GFP_ZERO, the platform guest kernel
+            // has init_on_alloc off, and this fd-backed zone is never
+            // prefaulted -- so such offsets are holes in the memfd.
+            // PUNCH_HOLE / MADV_DONTNEED on a hole still synthesizes a
+            // *synchronous* UFFD_EVENT_REMOVE on the uffd-registered chVA
+            // (the kernel emits it for the whole range regardless of
+            // residency, and MADV_DONTNEED blocks until the external
+            // handler consumes it). At boot the entire ballooned region
+            // is sparse, so this is a pure-overhead event storm that
+            // stalls the handler and back-pressures this balloon thread.
+            // Probe with SEEK_DATA: if [foff, end) holds no data there is
+            // nothing to reclaim, so skip both the fallocate and the
+            // MADV_DONTNEED -- the end state is identical. A range that
+            // genuinely needs reclaiming always has data, so is never
+            // skipped.
+            // SAFETY: FFI call; fd is this zone's memfd, used only via
+            // mmap + fallocate(explicit offset), so its file position is
+            // never relied upon.
+            let next_data = unsafe { libc::lseek64(fd, foff, libc::SEEK_DATA) };
+            if next_data < 0 {
+                // ENXIO: no data at/after foff -- range is all hole. Any
+                // other lseek error: fall through rather than mask it.
+                if io::Error::last_os_error().raw_os_error() == Some(libc::ENXIO) {
+                    return Ok(());
+                }
+            } else if next_data >= end {
+                // Next byte of data is past our range -- all hole.
+                return Ok(());
+            }
+
             // SAFETY: FFI call with valid arguments
             let res = unsafe {
                 libc::fallocate64(
-                    f_off.file().as_raw_fd(),
+                    fd,
                     libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                    (offset + f_off.start()) as libc::off64_t,
+                    foff,
                     range_len as libc::off64_t,
                 )
             };
