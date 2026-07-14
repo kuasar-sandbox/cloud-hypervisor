@@ -155,7 +155,7 @@ impl Request {
 struct PmemEpollHandler {
     mem: GuestMemoryAtomic<GuestMemoryMmap>,
     queue: Queue,
-    disk: File,
+    disk: Option<File>,
     interrupt_cb: Arc<dyn VirtioInterrupt>,
     queue_evt: EventFd,
     kill_evt: EventFd,
@@ -169,8 +169,8 @@ impl PmemEpollHandler {
         while let Some(mut desc_chain) = self.queue.pop_descriptor_chain(self.mem.memory()) {
             let len = match Request::parse(&mut desc_chain, self.access_platform.as_deref()) {
                 Ok(ref req) if (req.type_ == RequestType::Flush) => {
-                    let status_code = match self.disk.sync_all() {
-                        Ok(()) => VIRTIO_PMEM_RESP_TYPE_OK,
+                    let status_code = match self.disk.as_ref().map(File::sync_all).transpose() {
+                        Ok(_) => VIRTIO_PMEM_RESP_TYPE_OK,
                         Err(e) => {
                             error!("failed flushing disk image: {e}");
                             VIRTIO_PMEM_RESP_TYPE_EIO
@@ -282,7 +282,7 @@ impl Pmem {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         id: String,
-        disk: File,
+        disk: Option<File>,
         addr: GuestAddress,
         mapping: UserspaceMapping,
         iommu: bool,
@@ -324,7 +324,7 @@ impl Pmem {
                 ..Default::default()
             },
             id,
-            disk: Some(disk),
+            disk,
             config,
             mapping,
             seccomp_action,
@@ -385,44 +385,46 @@ impl VirtioDevice for Pmem {
     ) -> ActivateResult {
         self.common.activate(&queues, interrupt_cb.clone())?;
         let (kill_evt, pause_evt) = self.common.dup_eventfds();
-        if let Some(disk) = self.disk.as_ref() {
-            let disk = disk.try_clone().map_err(|e| {
+        let disk = self
+            .disk
+            .as_ref()
+            .map(File::try_clone)
+            .transpose()
+            .map_err(|e| {
                 error!("failed cloning pmem disk: {e}");
                 ActivateError::BadActivate
             })?;
 
-            let (_, queue, queue_evt) = queues.remove(0);
+        let (_, queue, queue_evt) = queues.remove(0);
 
-            let mut handler = PmemEpollHandler {
-                mem,
-                queue,
-                disk,
-                interrupt_cb,
-                queue_evt,
-                kill_evt,
-                pause_evt,
-                access_platform: self.common.access_platform.clone(),
-            };
+        let mut handler = PmemEpollHandler {
+            mem,
+            queue,
+            disk,
+            interrupt_cb,
+            queue_evt,
+            kill_evt,
+            pause_evt,
+            access_platform: self.common.access_platform.clone(),
+        };
 
-            let paused = self.common.paused.clone();
-            let paused_sync = self.common.paused_sync.clone();
-            let mut epoll_threads = Vec::new();
+        let paused = self.common.paused.clone();
+        let paused_sync = self.common.paused_sync.clone();
+        let mut epoll_threads = Vec::new();
 
-            spawn_virtio_thread(
-                &self.id,
-                &self.seccomp_action,
-                Thread::VirtioPmem,
-                &mut epoll_threads,
-                &self.exit_evt,
-                move || handler.run(&paused, paused_sync.as_ref().unwrap()),
-            )?;
+        spawn_virtio_thread(
+            &self.id,
+            &self.seccomp_action,
+            Thread::VirtioPmem,
+            &mut epoll_threads,
+            &self.exit_evt,
+            move || handler.run(&paused, paused_sync.as_ref().unwrap()),
+        )?;
 
-            self.common.epoll_threads = Some(epoll_threads);
+        self.common.epoll_threads = Some(epoll_threads);
 
-            event!("virtio-device", "activated", "id", &self.id);
-            return Ok(());
-        }
-        Err(ActivateError::BadActivate)
+        event!("virtio-device", "activated", "id", &self.id);
+        Ok(())
     }
 
     fn reset(&mut self) -> Option<Arc<dyn VirtioInterrupt>> {

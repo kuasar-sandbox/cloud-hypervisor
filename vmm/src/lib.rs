@@ -79,12 +79,14 @@ mod gdb;
 mod igvm;
 pub mod interrupt;
 pub mod landlock;
+mod lazy_pmem;
 pub mod memory_manager;
 pub mod migration;
 mod pci_segment;
 pub mod seccomp_filters;
 mod serial_manager;
 mod sigwinch_listener;
+mod userfaultfd;
 pub mod vm;
 pub mod vm_config;
 

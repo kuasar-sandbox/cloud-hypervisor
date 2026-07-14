@@ -1,0 +1,85 @@
+// Copyright 2026 The Cloud Hypervisor Authors
+//
+// SPDX-License-Identifier: Apache-2.0
+
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+
+const UFFD_API: u64 = 0xaa;
+const UFFDIO_API: libc::c_ulong = 0xc018_aa3f;
+const UFFDIO_REGISTER: libc::c_ulong = 0xc020_aa00;
+const UFFDIO_REGISTER_MODE_MISSING: u64 = 1;
+
+#[repr(C)]
+struct UffdioApi {
+    api: u64,
+    features: u64,
+    ioctls: u64,
+}
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+struct UffdioRange {
+    start: u64,
+    len: u64,
+}
+
+#[repr(C)]
+struct UffdioRegister {
+    range: UffdioRange,
+    mode: u64,
+    ioctls: u64,
+}
+
+pub(crate) struct Userfaultfd {
+    fd: OwnedFd,
+}
+
+impl Userfaultfd {
+    pub(crate) fn new(features: u64) -> io::Result<Self> {
+        // SAFETY: userfaultfd is called with valid integer flags and returns a
+        // new descriptor on success.
+        let raw =
+            unsafe { libc::syscall(libc::SYS_userfaultfd, libc::O_CLOEXEC | libc::O_NONBLOCK) };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: raw is a newly returned descriptor owned by this object.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw as RawFd) };
+
+        let mut request = UffdioApi {
+            api: UFFD_API,
+            features,
+            ioctls: 0,
+        };
+        // SAFETY: request is writable and valid for the ioctl duration.
+        if unsafe { libc::ioctl(fd.as_raw_fd(), UFFDIO_API, &mut request) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self { fd })
+    }
+
+    pub(crate) fn register_missing(&self, start: u64, len: u64) -> io::Result<()> {
+        if len == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "userfaultfd range must not be empty",
+            ));
+        }
+        let mut request = UffdioRegister {
+            range: UffdioRange { start, len },
+            mode: UFFDIO_REGISTER_MODE_MISSING,
+            ioctls: 0,
+        };
+        // SAFETY: request describes a live caller-owned mapping and remains
+        // valid for the ioctl duration.
+        if unsafe { libc::ioctl(self.fd.as_raw_fd(), UFFDIO_REGISTER, &mut request) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn as_raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+}
