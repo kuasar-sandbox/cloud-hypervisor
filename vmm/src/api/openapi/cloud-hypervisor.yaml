@@ -1058,8 +1058,6 @@ components:
           type: string
 
     PmemConfig:
-      required:
-        - file
       type: object
       properties:
         file:
@@ -1077,6 +1075,16 @@ components:
           type: integer
           format: int16
         id:
+          type: string
+        lazy:
+          type: boolean
+          default: false
+        data_size:
+          type: integer
+          format: int64
+        backend_id:
+          type: string
+        socket:
           type: string
 
     ConsoleConfig:

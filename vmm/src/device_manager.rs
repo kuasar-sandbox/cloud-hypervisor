@@ -310,6 +310,10 @@ pub enum DeviceManagerError {
     #[error("Cannot open persistent memory file")]
     PmemFileOpen(#[source] io::Error),
 
+    /// Persistent memory backing file is missing.
+    #[error("Persistent memory backing file is missing")]
+    PmemFileMissing,
+
     /// Cannot set persistent memory file size
     #[error("Cannot set persistent memory file size")]
     PmemFileSetLen(#[source] io::Error),
@@ -3234,7 +3238,11 @@ impl DeviceManager {
             None
         };
 
-        let (custom_flags, set_len) = if pmem_cfg.file.is_dir() {
+        let pmem_file = pmem_cfg
+            .file
+            .as_ref()
+            .ok_or(DeviceManagerError::PmemFileMissing)?;
+        let (custom_flags, set_len) = if pmem_file.is_dir() {
             if pmem_cfg.size.is_none() {
                 return Err(DeviceManagerError::PmemWithDirectorySizeMissing);
             }
@@ -3247,7 +3255,7 @@ impl DeviceManager {
             .read(true)
             .write(!pmem_cfg.discard_writes)
             .custom_flags(custom_flags)
-            .open(&pmem_cfg.file)
+            .open(pmem_file)
             .map_err(DeviceManagerError::PmemFileOpen)?;
 
         let size = if let Some(size) = pmem_cfg.size {

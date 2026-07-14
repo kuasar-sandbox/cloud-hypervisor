@@ -366,6 +366,9 @@ pub enum ValidationError {
     /// Invalid NUMA Configuration
     #[error("NUMA Configuration is invalid")]
     InvalidNumaConfig(String),
+    /// Invalid persistent memory configuration.
+    #[error("Invalid persistent memory configuration: {0}")]
+    InvalidPmemConfig(String),
 }
 
 type ValidationResult<T> = std::result::Result<T, ValidationError>;
@@ -1823,7 +1826,8 @@ impl FwCfgItem {
 impl PmemConfig {
     pub const SYNTAX: &'static str = "Persistent memory parameters \
     \"file=<backing_file_path>,size=<persistent_memory_size>,iommu=on|off,\
-    discard_writes=on|off,id=<device_id>,pci_segment=<segment_id>\"";
+    discard_writes=on|off,id=<device_id>,pci_segment=<segment_id>,lazy=on|off,\
+    data_size=<image_size>,backend_id=<content_id>,socket=<socket_path>\"";
 
     pub fn parse(pmem: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -1833,10 +1837,14 @@ impl PmemConfig {
             .add("iommu")
             .add("discard_writes")
             .add("id")
-            .add("pci_segment");
+            .add("pci_segment")
+            .add("lazy")
+            .add("data_size")
+            .add("backend_id")
+            .add("socket");
         parser.parse(pmem).map_err(Error::ParsePersistentMemory)?;
 
-        let file = PathBuf::from(parser.get("file").ok_or(Error::ParsePmemFileMissing)?);
+        let file = parser.get("file").map(PathBuf::from);
         let size = parser
             .convert::<ByteSized>("size")
             .map_err(Error::ParsePersistentMemory)?
@@ -1856,18 +1864,85 @@ impl PmemConfig {
             .convert("pci_segment")
             .map_err(Error::ParsePersistentMemory)?
             .unwrap_or_default();
+        let lazy = parser
+            .convert::<Toggle>("lazy")
+            .map_err(Error::ParsePersistentMemory)?
+            .unwrap_or(Toggle(false))
+            .0;
+        let data_size = parser
+            .convert::<ByteSized>("data_size")
+            .map_err(Error::ParsePersistentMemory)?
+            .map(|value| value.0);
+        let backend_id = parser.get("backend_id");
+        let socket = parser.get("socket").map(PathBuf::from);
 
-        Ok(PmemConfig {
+        let config = PmemConfig {
             file,
             size,
             iommu,
             discard_writes,
             id,
             pci_segment,
-        })
+            lazy,
+            data_size,
+            backend_id,
+            socket,
+        };
+        config.validate_mode().map_err(|message| {
+            Error::ParsePersistentMemory(OptionParserError::InvalidValue(message))
+        })?;
+        Ok(config)
+    }
+
+    fn validate_mode(&self) -> std::result::Result<(), String> {
+        if !self.lazy {
+            if self.file.is_none() {
+                return Err("file is required unless lazy=on".to_string());
+            }
+            if self.data_size.is_some() || self.backend_id.is_some() || self.socket.is_some() {
+                return Err("data_size, backend_id and socket require lazy=on".to_string());
+            }
+            return Ok(());
+        }
+
+        if self.file.is_some() {
+            return Err("file must not be specified when lazy=on".to_string());
+        }
+        if !self.discard_writes {
+            return Err("discard_writes=on is required when lazy=on".to_string());
+        }
+        let size = self
+            .size
+            .ok_or_else(|| "size is required when lazy=on".to_string())?;
+        if size == 0 || !size.is_multiple_of(2 << 20) {
+            return Err("lazy pmem size must be non-zero and 2 MiB aligned".to_string());
+        }
+        let data_size = self
+            .data_size
+            .ok_or_else(|| "data_size is required when lazy=on".to_string())?;
+        if data_size == 0 || data_size > size {
+            return Err("lazy pmem data_size must be in (0, size]".to_string());
+        }
+        if self
+            .backend_id
+            .as_ref()
+            .is_none_or(|backend_id| backend_id.is_empty())
+        {
+            return Err("backend_id is required when lazy=on".to_string());
+        }
+        if self
+            .socket
+            .as_ref()
+            .is_none_or(|socket| socket.as_os_str().is_empty())
+        {
+            return Err("socket is required when lazy=on".to_string());
+        }
+        Ok(())
     }
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+        self.validate_mode()
+            .map_err(ValidationError::InvalidPmemConfig)?;
         if let Some(platform_config) = vm_config.platform.as_ref() {
             if self.pci_segment >= platform_config.num_pci_segments {
                 return Err(ValidationError::InvalidPciSegment(self.pci_segment));
@@ -3794,12 +3869,16 @@ mod unit_tests {
 
     fn pmem_fixture() -> PmemConfig {
         PmemConfig {
-            file: PathBuf::from("/tmp/pmem"),
+            file: Some(PathBuf::from("/tmp/pmem")),
             size: Some(128 << 20),
             iommu: false,
             discard_writes: false,
             id: None,
             pci_segment: 0,
+            lazy: false,
+            data_size: None,
+            backend_id: None,
+            socket: None,
         }
     }
 
@@ -3829,6 +3908,38 @@ mod unit_tests {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn test_lazy_pmem_parsing() {
+        let config = PmemConfig::parse(
+            "size=2M,data_size=1M,id=root-lower,discard_writes=on,lazy=on,\
+             backend_id=sha256:content,socket=/run/lazy-pmem/backend.sock",
+        )
+        .unwrap();
+
+        assert!(config.lazy);
+        assert_eq!(config.file, None);
+        assert_eq!(config.size, Some(2 << 20));
+        assert_eq!(config.data_size, Some(1 << 20));
+        assert_eq!(config.backend_id.as_deref(), Some("sha256:content"));
+        assert_eq!(
+            config.socket.as_deref(),
+            Some(std::path::Path::new("/run/lazy-pmem/backend.sock"))
+        );
+
+        for invalid in [
+            "lazy=on,size=2M,data_size=1M,backend_id=x,socket=/tmp/backend.sock",
+            "lazy=on,file=/tmp/cache,size=2M,data_size=1M,discard_writes=on,backend_id=x,socket=/tmp/backend.sock",
+            "lazy=on,size=1M,data_size=1M,discard_writes=on,backend_id=x,socket=/tmp/backend.sock",
+            "lazy=on,size=2M,data_size=3M,discard_writes=on,backend_id=x,socket=/tmp/backend.sock",
+            "lazy=on,size=2M,data_size=1M,discard_writes=on,socket=/tmp/backend.sock",
+            "lazy=on,size=2M,data_size=1M,discard_writes=on,backend_id=x",
+            "file=/tmp/pmem,size=2M,data_size=1M",
+            "lazy=on,size=2M,blob_size=1M,discard_writes=on,instance_id=x,lazyd_data_socket=/tmp/lazyd.sock",
+        ] {
+            assert!(PmemConfig::parse(invalid).is_err(), "accepted {invalid}");
+        }
     }
 
     #[test]

@@ -493,7 +493,8 @@ impl ApplyLandlock for FsConfig {
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct PmemConfig {
-    pub file: PathBuf,
+    #[serde(default)]
+    pub file: Option<PathBuf>,
     #[serde(default)]
     pub size: Option<u64>,
     #[serde(default)]
@@ -504,12 +505,25 @@ pub struct PmemConfig {
     pub id: Option<String>,
     #[serde(default)]
     pub pci_segment: u16,
+    #[serde(default)]
+    pub lazy: bool,
+    #[serde(default)]
+    pub data_size: Option<u64>,
+    #[serde(default)]
+    pub backend_id: Option<String>,
+    #[serde(default)]
+    pub socket: Option<PathBuf>,
 }
 
 impl ApplyLandlock for PmemConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
-        let access = if self.discard_writes { "r" } else { "rw" };
-        landlock.add_rule_with_access(&self.file, access)?;
+        if let Some(file) = &self.file {
+            let access = if self.discard_writes { "r" } else { "rw" };
+            landlock.add_rule_with_access(file, access)?;
+        }
+        if let Some(socket) = &self.socket {
+            landlock.add_rule_with_access(socket, "rw")?;
+        }
         Ok(())
     }
 }
