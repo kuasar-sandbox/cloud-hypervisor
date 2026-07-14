@@ -182,8 +182,8 @@ impl LazyPmemBackendClient {
         Ok(FetchResult { file, range })
     }
 
-    pub(crate) fn socket(&self) -> &Path {
-        &self.socket
+    pub(crate) fn page_size(&self) -> u64 {
+        self.page_size
     }
 
     fn validate_requested_range(&self, pos: u64, len: u64) -> io::Result<()> {
@@ -219,18 +219,18 @@ impl LazyPmemBackendClient {
         let range_end = range
             .off
             .checked_add(range.len)
-            .ok_or_else(|| invalid_data("lazyd response range overflows u64"))?;
+            .ok_or_else(|| invalid_data("lazy pmem backend range overflows u64"))?;
         let dev_end = range
             .dev_off
             .checked_add(range.len)
-            .ok_or_else(|| invalid_data("lazyd response device range overflows u64"))?;
+            .ok_or_else(|| invalid_data("lazy pmem backend device range overflows u64"))?;
         let requested_end = requested_pos + requested_len;
         if range_end > self.pmem_size || dev_end > self.pmem_size {
-            return Err(invalid_data("lazyd response range exceeds pmem size"));
+            return Err(invalid_data("lazy pmem backend range exceeds pmem size"));
         }
         if range.off > requested_pos || range_end < requested_end {
             return Err(invalid_data(
-                "lazyd response range does not contain the requested range",
+                "lazy pmem backend range does not contain the requested range",
             ));
         }
         Ok(())

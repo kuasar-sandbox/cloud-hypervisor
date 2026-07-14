@@ -25,6 +25,8 @@ use vhost::vhost_kern::vhost_binding::{
     VHOST_VDPA_SET_STATUS, VHOST_VDPA_SET_VRING_ENABLE, VHOST_VDPA_SUSPEND,
 };
 
+use crate::userfaultfd::{UFFDIO_WAKE, UFFDIO_ZEROPAGE};
+
 #[derive(Copy, Clone)]
 pub enum Thread {
     HttpApi,
@@ -112,8 +114,8 @@ mod kvm {
 const BLKDISCARD: u64 = 0x1277; // _IO(0x12, 119)
 const BLKZEROOUT: u64 = 0x127f; // _IO(0x12, 127)
 
-// userfaultfd ioctls used by the patched create_ram_region path when
-// `--memory-zone uffd_socket=...` is set. Computed from
+// userfaultfd ioctls used when Cloud Hypervisor owns a registered range.
+// Computed from
 // <linux/userfaultfd.h>:
 //   _IOWR(0xAA, 0x00, struct uffdio_register)  → 0xc020_aa00
 //   _IOWR(0xAA, 0x3F, struct uffdio_api)       → 0xc018_aa3f
@@ -273,12 +275,11 @@ fn create_vmm_ioctl_seccomp_rule_common(
         and![Cond::new(1, ArgLen::Dword, Eq, BLKIOOPT as _)?],
         and![Cond::new(1, ArgLen::Dword, Eq, BLKDISCARD as _)?],
         and![Cond::new(1, ArgLen::Dword, Eq, BLKZEROOUT as _)?],
-        // S1.6: allow UFFDIO_API + UFFDIO_REGISTER for the uffd-backed
-        // memory-zone path (commit S1.5: CH creates its own uffd in
-        // create_ram_region, configures features, and registers the
-        // chVA range MISSING).
+        // Allow setup and resolution of Cloud Hypervisor-owned UFFD ranges.
         and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_API as _)?],
         and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_REGISTER as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_WAKE as _)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_ZEROPAGE as _)?],
         and![Cond::new(1, ArgLen::Dword, Eq, FIOCLEX as _)?],
         and![Cond::new(1, ArgLen::Dword, Eq, FIONBIO as _)?],
         and![Cond::new(1, ArgLen::Dword, Eq, SIOCGIFFLAGS)?],
@@ -637,8 +638,8 @@ fn vmm_thread_rules(
         (libc::SYS_mbind, vec![]),
         (libc::SYS_memfd_create, vec![]),
         (libc::SYS_mmap, vec![]),
-        // S1.6: allow userfaultfd() — patched create_ram_region creates
-        // its own uffd in CH's mm so faults route correctly.
+        // Cloud Hypervisor creates UFFD descriptors for user-managed RAM and
+        // lazy pmem mappings.
         (libc::SYS_userfaultfd, vec![]),
         (libc::SYS_mprotect, vec![]),
         (libc::SYS_mremap, vec![]),

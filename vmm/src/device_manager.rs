@@ -3360,9 +3360,13 @@ impl DeviceManager {
                         .backend_id
                         .clone()
                         .ok_or(DeviceManagerError::PmemLazyConfigMissing("backend_id"))?,
-                    pmem_cfg.socket.clone().ok_or(
-                        DeviceManagerError::PmemLazyConfigMissing("socket"),
-                    )?,
+                    pmem_cfg
+                        .socket
+                        .clone()
+                        .ok_or(DeviceManagerError::PmemLazyConfigMissing("socket"))?,
+                    self.exit_evt
+                        .try_clone()
+                        .map_err(DeviceManagerError::EventFd)?,
                 )
                 .map_err(DeviceManagerError::PmemUffd)?,
             )
@@ -5661,6 +5665,9 @@ impl Drop for DeviceManager {
         if let Err(e) = self.resume() {
             error!("Error resuming DeviceManager: {e:?}");
         }
+
+        // Stop UFFD handlers before dropping the pmem mappings they monitor.
+        self.lazy_pmem_regions.clear();
 
         for handle in self.virtio_devices.drain(..) {
             handle.virtio_device.lock().unwrap().shutdown();
