@@ -36,7 +36,7 @@ fn classify_fault(
     let offset = fault_hva - base_hva;
     let data_end = data_size
         .checked_add(page_size - 1)
-        .ok_or_else(|| invalid_data("lazy pmem blob size overflows u64"))?
+        .ok_or_else(|| invalid_data("lazy pmem data size overflows u64"))?
         / page_size
         * page_size;
     if offset < data_end {
@@ -68,7 +68,8 @@ impl LazyPmemRegion {
         socket: PathBuf,
         exit_evt: EventFd,
     ) -> io::Result<Self> {
-        let backend = LazyPmemBackendClient::new(socket.clone(), backend_id.clone(), size)?;
+        let socket_display = socket.display().to_string();
+        let backend = LazyPmemBackendClient::new(socket, backend_id.clone(), size)?;
         let uffd = Userfaultfd::new(0)?;
         uffd.register_missing(base_hva, size)?;
         let uffd_fd = uffd.as_raw_fd();
@@ -79,16 +80,22 @@ impl LazyPmemRegion {
             .name("lazy-pmem".to_string())
             .spawn(move || {
                 if let Err(error) =
-                    run_fault_loop(uffd, backend, base_hva, size, data_size, thread_kill_evt)
+                    run_fault_loop(&uffd, &backend, base_hva, size, data_size, &thread_kill_evt)
                 {
                     error!(
-                        "Lazy pmem fault handler failed for backend {}: {}",
-                        thread_backend_id, error
+                        "Lazy pmem fault handler failed for backend {thread_backend_id}: {error}"
                     );
-                    if let Err(signal_error) = exit_evt.write(1) {
+                    if let Err(signal_error) = exit_evt.write(crate::FATAL_EXIT_EVENT) {
                         error!(
-                            "Failed to signal VM exit after lazy pmem fault handler error: {}",
-                            signal_error
+                            "Failed to signal VM exit after lazy pmem fault handler error: {signal_error}"
+                        );
+                    }
+                    // Keep the UFFD open until DeviceManager teardown. Closing
+                    // it here would let the kernel resolve the anonymous fault
+                    // with zeroes before the fatal VM exit is processed.
+                    if let Err(shutdown_error) = wait_for_shutdown(&thread_kill_evt) {
+                        error!(
+                            "Failed while waiting to stop lazy pmem handler: {shutdown_error}"
                         );
                     }
                 }
@@ -107,7 +114,7 @@ impl LazyPmemRegion {
             region.size,
             region.data_size,
             region.backend_id,
-            socket.display(),
+            socket_display,
             uffd_fd
         );
         Ok(region)
@@ -127,21 +134,18 @@ impl Drop for LazyPmemRegion {
             .take()
             .is_some_and(|handler| handler.join().is_err())
         {
-            error!(
-                "Lazy pmem handler panicked for backend {}",
-                self.backend_id
-            );
+            error!("Lazy pmem handler panicked for backend {}", self.backend_id);
         }
     }
 }
 
 fn run_fault_loop(
-    uffd: Userfaultfd,
-    backend: LazyPmemBackendClient,
+    uffd: &Userfaultfd,
+    backend: &LazyPmemBackendClient,
     base_hva: u64,
     pmem_size: u64,
     data_size: u64,
-    kill_evt: EventFd,
+    kill_evt: &EventFd,
 ) -> io::Result<()> {
     let mut pollfds = [
         libc::pollfd {
@@ -173,7 +177,31 @@ fn run_fault_loop(
         check_poll_errors(pollfds[1].revents, "lazy pmem userfaultfd")?;
         if pollfds[1].revents & libc::POLLIN != 0 {
             let fault_hva = uffd.read_pagefault()?;
-            resolve_fault(&uffd, &backend, base_hva, pmem_size, data_size, fault_hva)?;
+            resolve_fault(uffd, backend, base_hva, pmem_size, data_size, fault_hva)?;
+        }
+    }
+}
+
+fn wait_for_shutdown(kill_evt: &EventFd) -> io::Result<()> {
+    let mut pollfd = libc::pollfd {
+        fd: kill_evt.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: pollfd points to one initialized pollfd entry.
+        let ready = unsafe { libc::poll(&mut pollfd, 1, -1) };
+        if ready < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        check_poll_errors(pollfd.revents, "lazy pmem kill event")?;
+        if pollfd.revents & libc::POLLIN != 0 {
+            kill_evt.read()?;
+            return Ok(());
         }
     }
 }
