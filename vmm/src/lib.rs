@@ -80,6 +80,7 @@ mod igvm;
 pub mod interrupt;
 pub mod landlock;
 mod lazy_pmem;
+mod lazy_pmem_backend;
 pub mod memory_manager;
 pub mod migration;
 mod pci_segment;

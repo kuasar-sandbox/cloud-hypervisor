@@ -7,6 +7,7 @@ use std::path::PathBuf;
 
 use log::info;
 
+use crate::lazy_pmem_backend::LazyPmemBackendClient;
 use crate::userfaultfd::Userfaultfd;
 
 pub(crate) struct LazyPmemRegion {
@@ -14,8 +15,8 @@ pub(crate) struct LazyPmemRegion {
     pub(crate) size: u64,
     pub(crate) data_size: u64,
     pub(crate) backend_id: String,
-    pub(crate) socket: PathBuf,
     pub(crate) uffd: Userfaultfd,
+    pub(crate) backend: LazyPmemBackendClient,
 }
 
 impl LazyPmemRegion {
@@ -26,6 +27,8 @@ impl LazyPmemRegion {
         backend_id: String,
         socket: PathBuf,
     ) -> io::Result<Self> {
+        let socket_display = socket.display().to_string();
+        let backend = LazyPmemBackendClient::new(socket, backend_id.clone(), size)?;
         let uffd = Userfaultfd::new(0)?;
         uffd.register_missing(base_hva, size)?;
         let region = Self {
@@ -33,8 +36,8 @@ impl LazyPmemRegion {
             size,
             data_size,
             backend_id,
-            socket,
             uffd,
+            backend,
         };
         info!(
             "Registered lazy pmem UFFD: hva={:#x}, size={}, data_size={}, backend_id={}, socket={}, uffd={}",
@@ -42,7 +45,7 @@ impl LazyPmemRegion {
             region.size,
             region.data_size,
             region.backend_id,
-            region.socket.display(),
+            socket_display,
             region.uffd.as_raw_fd()
         );
         Ok(region)
