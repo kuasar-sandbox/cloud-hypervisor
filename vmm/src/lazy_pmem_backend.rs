@@ -174,7 +174,7 @@ impl LazyPmemBackendClient {
         }
         if metadata.len() != self.pmem_size {
             return Err(invalid_data(format!(
-                "lazy pmem backend cache fd size is {}, expected {}",
+                "lazy pmem backend fd size is {}, expected {}",
                 metadata.len(),
                 self.pmem_size
             )));
@@ -373,12 +373,18 @@ fn invalid_data(error: impl ToString) -> io::Error {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_arch = "x86_64")]
+    use std::ffi::CString;
     use std::fs::OpenOptions;
     use std::io::{Read, Seek, SeekFrom, Write};
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
 
+    #[cfg(target_arch = "x86_64")]
+    use kvm_bindings::{kvm_regs, kvm_userspace_memory_region};
+    #[cfg(target_arch = "x86_64")]
+    use kvm_ioctls::{Kvm, VcpuExit};
     use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
     use super::*;
@@ -571,6 +577,125 @@ mod tests {
         server.join().unwrap();
         unmap(mapping, page_size);
         let _ = std::fs::remove_file(socket_path);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn kvm_memslot_fault_is_resolved_by_lazy_region() {
+        let path =
+            std::env::var("CLOUD_HYPERVISOR_KVM_PATH").unwrap_or_else(|_| "/dev/kvm".to_string());
+        let path = CString::new(path).unwrap();
+        let kvm = match Kvm::new_with_path(&path) {
+            Ok(kvm) => kvm,
+            Err(error) if error.errno() == libc::ENOENT || error.errno() == libc::EACCES => return,
+            Err(error) => panic!("failed to open KVM: {error}"),
+        };
+        let page_size = page_size();
+        let (socket_path, listener) = test_listener();
+        let cache_path = socket_path.with_extension("cache");
+        let mut cache = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&cache_path)
+            .unwrap();
+        cache.set_len(page_size).unwrap();
+        cache.write_all(&vec![0x5a; page_size as usize]).unwrap();
+        cache.seek(SeekFrom::Start(0)).unwrap();
+
+        let server = thread::spawn(move || {
+            let stream = listener.accept().unwrap();
+            let request = receive_fetch(&stream);
+            let response = serde_json::to_vec(&serde_json::json!({
+                "protocol_version": 1,
+                "request_id": request.request_id,
+                "op": "fetch_ok",
+                "ranges": [{"off": 0, "len": page_size, "dev_off": 0}]
+            }))
+            .unwrap();
+            stream
+                .send_with_fd(response.as_slice(), cache.as_raw_fd())
+                .unwrap();
+        });
+
+        let code_mapping = anonymous_mapping(page_size);
+        let lazy_mapping = anonymous_mapping(page_size);
+        // mov al, byte ptr ds:[0x1000]; hlt.
+        let guest_code = [0xa0_u8, 0x00, 0x10, 0xf4];
+        // SAFETY: code_mapping owns a writable page larger than guest_code.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                guest_code.as_ptr(),
+                code_mapping.cast::<u8>(),
+                guest_code.len(),
+            );
+        }
+
+        let exit_evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let region = LazyPmemRegion::register(
+            lazy_mapping as u64,
+            page_size,
+            page_size,
+            "instance".to_string(),
+            socket_path.clone(),
+            exit_evt,
+        )
+        .unwrap();
+
+        let vm = kvm.create_vm().unwrap();
+        let code_region = kvm_userspace_memory_region {
+            slot: 0,
+            guest_phys_addr: 0,
+            memory_size: page_size,
+            userspace_addr: code_mapping as u64,
+            flags: 0,
+        };
+        let lazy_region = kvm_userspace_memory_region {
+            slot: 1,
+            guest_phys_addr: page_size,
+            memory_size: page_size,
+            userspace_addr: lazy_mapping as u64,
+            flags: 0,
+        };
+        // SAFETY: both mappings remain live until vm and the vCPU are dropped.
+        unsafe {
+            vm.set_user_memory_region(code_region).unwrap();
+            vm.set_user_memory_region(lazy_region).unwrap();
+        }
+
+        let mut vcpu = vm.create_vcpu(0).unwrap();
+        let mut sregs = vcpu.get_sregs().unwrap();
+        sregs.cs.base = 0;
+        sregs.cs.selector = 0;
+        sregs.ds.base = 0;
+        sregs.ds.selector = 0;
+        vcpu.set_sregs(&sregs).unwrap();
+        vcpu.set_regs(&kvm_regs {
+            rip: 0,
+            rflags: 2,
+            ..Default::default()
+        })
+        .unwrap();
+
+        let value = loop {
+            match vcpu.run() {
+                Ok(VcpuExit::Hlt) => break vcpu.get_regs().unwrap().rax as u8,
+                Ok(VcpuExit::Intr) => continue,
+                Ok(exit) => panic!("unexpected vCPU exit: {exit:?}"),
+                Err(error) => panic!("vCPU run failed: {error}"),
+            }
+        };
+        assert_eq!(value, 0x5a);
+
+        drop(region);
+        server.join().unwrap();
+        drop(vcpu);
+        drop(vm);
+        unmap(code_mapping, page_size);
+        unmap(lazy_mapping, page_size);
+        let _ = std::fs::remove_file(socket_path);
+        let _ = std::fs::remove_file(cache_path);
     }
 
     fn receive_fetch(stream: &Seqpacket) -> FetchRequest {
