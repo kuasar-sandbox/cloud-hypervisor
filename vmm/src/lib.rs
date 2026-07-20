@@ -79,17 +79,28 @@ mod gdb;
 mod igvm;
 pub mod interrupt;
 pub mod landlock;
+mod lazy_pmem;
+mod lazy_pmem_backend;
 pub mod memory_manager;
 pub mod migration;
 mod pci_segment;
 pub mod seccomp_filters;
 mod serial_manager;
 mod sigwinch_listener;
+mod userfaultfd;
 pub mod vm;
 pub mod vm_config;
 
 type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
 type GuestRegionMmap = vm_memory::GuestRegionMmap<AtomicBitmap>;
+
+// EventFd is a 64-bit counter. Device workers use the high bit to distinguish
+// a fatal asynchronous failure from an ordinary guest or API shutdown.
+const FATAL_EXIT_EVENT: u64 = 1 << 63;
+
+fn is_fatal_exit_event(value: u64) -> bool {
+    value & FATAL_EXIT_EVENT != 0
+}
 
 /// Errors associated with VMM management
 #[derive(Debug, Error)]
@@ -159,6 +170,10 @@ pub enum Error {
     /// Cannot shut the VMM down
     #[error("Error shutting down VMM")]
     VmmShutdown(#[source] VmError),
+
+    /// A device worker encountered an unrecoverable asynchronous error.
+    #[error("Fatal VM exit requested by a device worker")]
+    FatalVmExit,
 
     /// Cannot create seccomp filter
     #[error("Error creating seccomp filter")]
@@ -1538,8 +1553,12 @@ impl Vmm {
                     EpollDispatch::Exit => {
                         info!("VM exit event");
                         // Consume the event.
-                        self.exit_evt.read().map_err(Error::EventFdRead)?;
+                        let exit_value = self.exit_evt.read().map_err(Error::EventFdRead)?;
                         self.vmm_shutdown().map_err(Error::VmmShutdown)?;
+
+                        if is_fatal_exit_event(exit_value) {
+                            return Err(Error::FatalVmExit);
+                        }
 
                         break 'outer;
                     }
@@ -2381,6 +2400,13 @@ mod unit_tests {
         ConsoleConfig, ConsoleOutputMode, CpuFeatures, CpusConfig, HotplugMethod, MemoryConfig,
         PayloadConfig, RngConfig,
     };
+
+    #[test]
+    fn test_fatal_exit_event_encoding() {
+        assert!(!is_fatal_exit_event(1));
+        assert!(is_fatal_exit_event(FATAL_EXIT_EVENT));
+        assert!(is_fatal_exit_event(FATAL_EXIT_EVENT + 1));
+    }
 
     fn create_dummy_vmm() -> Vmm {
         Vmm::new(

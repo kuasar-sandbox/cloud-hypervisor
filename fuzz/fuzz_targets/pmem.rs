@@ -123,7 +123,7 @@ fn create_dummy_pmem() -> Pmem {
 
     Pmem::new(
         "tmp".to_owned(),
-        file,
+        Some(file),
         guest_addr,
         dummy_user_mapping,
         false,

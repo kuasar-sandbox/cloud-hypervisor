@@ -94,5 +94,9 @@ vmm-sys-util = { workspace = true, features = ["with-serde"] }
 zbus = { version = "5.13.2", optional = true }
 zerocopy = { workspace = true, features = ["alloc", "derive"] }
 
+[dev-dependencies]
+kvm-bindings = { workspace = true }
+kvm-ioctls = { workspace = true }
+
 [lints]
 workspace = true

@@ -76,8 +76,8 @@ use hypervisor::IoEventAddress;
 #[cfg(target_arch = "aarch64")]
 use hypervisor::arch::aarch64::regs::AARCH64_PMU_IRQ;
 use libc::{
-    MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, O_TMPFILE, PROT_READ, PROT_WRITE, TCSANOW, tcsetattr,
-    termios,
+    MAP_ANONYMOUS, MAP_NORESERVE, MAP_PRIVATE, MAP_SHARED, O_TMPFILE, PROT_READ, PROT_WRITE,
+    TCSANOW, tcsetattr, termios,
 };
 use log::{debug, error, info, warn};
 use pci::{
@@ -120,6 +120,7 @@ use crate::console_devices::{ConsoleDeviceError, ConsoleInfo, ConsoleOutput};
 use crate::cpu::{CPU_MANAGER_ACPI_SIZE, CpuManager};
 use crate::device_tree::{DeviceNode, DeviceTree};
 use crate::interrupt::{LegacyUserspaceInterruptManager, MsiInterruptManager};
+use crate::lazy_pmem::LazyPmemRegion;
 use crate::memory_manager::{Error as MemoryManagerError, MEMORY_MANAGER_ACPI_SIZE, MemoryManager};
 use crate::pci_segment::PciSegment;
 use crate::serial_manager::{Error as SerialManagerError, SerialManager};
@@ -309,6 +310,18 @@ pub enum DeviceManagerError {
     /// Cannot open persistent memory file
     #[error("Cannot open persistent memory file")]
     PmemFileOpen(#[source] io::Error),
+
+    /// Persistent memory backing file is missing.
+    #[error("Persistent memory backing file is missing")]
+    PmemFileMissing,
+
+    /// Lazy persistent memory configuration is incomplete.
+    #[error("Lazy persistent memory configuration is missing {0}")]
+    PmemLazyConfigMissing(&'static str),
+
+    /// Cannot register lazy persistent memory with userfaultfd.
+    #[error("Cannot register lazy persistent memory with userfaultfd")]
+    PmemUffd(#[source] io::Error),
 
     /// Cannot set persistent memory file size
     #[error("Cannot set persistent memory file size")]
@@ -1128,6 +1141,9 @@ pub struct DeviceManager {
     #[cfg(feature = "ivshmem")]
     // ivshmem device
     ivshmem_device: Option<Arc<Mutex<devices::IvshmemDevice>>>,
+
+    // Lazy pmem UFFD registrations must outlive their userspace mappings.
+    lazy_pmem_regions: Vec<LazyPmemRegion>,
 }
 
 fn create_mmio_allocators(
@@ -1395,6 +1411,7 @@ impl DeviceManager {
             fw_cfg: None,
             #[cfg(feature = "ivshmem")]
             ivshmem_device: None,
+            lazy_pmem_regions: Vec::new(),
         };
 
         let device_manager = Arc::new(Mutex::new(device_manager));
@@ -3234,31 +3251,45 @@ impl DeviceManager {
             None
         };
 
-        let (custom_flags, set_len) = if pmem_cfg.file.is_dir() {
-            if pmem_cfg.size.is_none() {
-                return Err(DeviceManagerError::PmemWithDirectorySizeMissing);
-            }
-            (O_TMPFILE, true)
+        let (file, size) = if pmem_cfg.lazy {
+            (
+                None,
+                pmem_cfg
+                    .size
+                    .ok_or(DeviceManagerError::PmemLazyConfigMissing("size"))?,
+            )
         } else {
-            (0, false)
-        };
+            let pmem_file = pmem_cfg
+                .file
+                .as_ref()
+                .ok_or(DeviceManagerError::PmemFileMissing)?;
+            let (custom_flags, set_len) = if pmem_file.is_dir() {
+                if pmem_cfg.size.is_none() {
+                    return Err(DeviceManagerError::PmemWithDirectorySizeMissing);
+                }
+                (O_TMPFILE, true)
+            } else {
+                (0, false)
+            };
 
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(!pmem_cfg.discard_writes)
-            .custom_flags(custom_flags)
-            .open(&pmem_cfg.file)
-            .map_err(DeviceManagerError::PmemFileOpen)?;
+            let mut file = OpenOptions::new()
+                .read(true)
+                .write(!pmem_cfg.discard_writes)
+                .custom_flags(custom_flags)
+                .open(pmem_file)
+                .map_err(DeviceManagerError::PmemFileOpen)?;
 
-        let size = if let Some(size) = pmem_cfg.size {
-            if set_len {
-                file.set_len(size)
-                    .map_err(DeviceManagerError::PmemFileSetLen)?;
-            }
-            size
-        } else {
-            file.seek(SeekFrom::End(0))
-                .map_err(DeviceManagerError::PmemFileSetLen)?
+            let size = if let Some(size) = pmem_cfg.size {
+                if set_len {
+                    file.set_len(size)
+                        .map_err(DeviceManagerError::PmemFileSetLen)?;
+                }
+                size
+            } else {
+                file.seek(SeekFrom::End(0))
+                    .map_err(DeviceManagerError::PmemFileSetLen)?
+            };
+            (Some(file), size)
         };
 
         if size % 0x20_0000 != 0 {
@@ -3293,20 +3324,55 @@ impl DeviceManager {
             (base.raw_value(), size)
         };
 
-        let cloned_file = file.try_clone().map_err(DeviceManagerError::CloneFile)?;
-        let mmap_region = MmapRegion::build(
-            Some(FileOffset::new(cloned_file, 0)),
-            region_size as usize,
-            PROT_READ | PROT_WRITE,
-            MAP_NORESERVE
-                | if pmem_cfg.discard_writes {
-                    MAP_PRIVATE
-                } else {
-                    MAP_SHARED
-                },
-        )
+        let mmap_region = if let Some(file) = &file {
+            let cloned_file = file.try_clone().map_err(DeviceManagerError::CloneFile)?;
+            MmapRegion::build(
+                Some(FileOffset::new(cloned_file, 0)),
+                region_size as usize,
+                PROT_READ | PROT_WRITE,
+                MAP_NORESERVE
+                    | if pmem_cfg.discard_writes {
+                        MAP_PRIVATE
+                    } else {
+                        MAP_SHARED
+                    },
+            )
+        } else {
+            MmapRegion::build(
+                None,
+                region_size as usize,
+                PROT_READ | PROT_WRITE,
+                MAP_NORESERVE | MAP_PRIVATE | MAP_ANONYMOUS,
+            )
+        }
         .map_err(DeviceManagerError::NewMmapRegion)?;
         let host_addr = mmap_region.as_ptr();
+
+        let lazy_region = if pmem_cfg.lazy {
+            Some(
+                LazyPmemRegion::register(
+                    host_addr as u64,
+                    region_size,
+                    pmem_cfg
+                        .data_size
+                        .ok_or(DeviceManagerError::PmemLazyConfigMissing("data_size"))?,
+                    pmem_cfg
+                        .backend_id
+                        .clone()
+                        .ok_or(DeviceManagerError::PmemLazyConfigMissing("backend_id"))?,
+                    pmem_cfg
+                        .socket
+                        .clone()
+                        .ok_or(DeviceManagerError::PmemLazyConfigMissing("socket"))?,
+                    self.exit_evt
+                        .try_clone()
+                        .map_err(DeviceManagerError::EventFd)?,
+                )
+                .map_err(DeviceManagerError::PmemUffd)?,
+            )
+        } else {
+            None
+        };
 
         // SAFETY: host_addr points to region_size bytes of mmap-allocated memory.
         let mem_slot = unsafe {
@@ -3341,6 +3407,10 @@ impl DeviceManager {
             )
             .map_err(DeviceManagerError::CreateVirtioPmem)?,
         ));
+
+        if let Some(lazy_region) = lazy_region {
+            self.lazy_pmem_regions.push(lazy_region);
+        }
 
         // Update the device tree with correct resource information and with
         // the migratable device.
@@ -5595,6 +5665,9 @@ impl Drop for DeviceManager {
         if let Err(e) = self.resume() {
             error!("Error resuming DeviceManager: {e:?}");
         }
+
+        // Stop UFFD handlers before dropping the pmem mappings they monitor.
+        self.lazy_pmem_regions.clear();
 
         for handle in self.virtio_devices.drain(..) {
             handle.virtio_device.lock().unwrap().shutdown();

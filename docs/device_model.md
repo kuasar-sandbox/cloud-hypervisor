@@ -141,6 +141,21 @@ allows bypassing the guest page cache and improve the guest memory footprint.
 This device is always built-in, and it is enabled based on the presence of the
 flag `--pmem`.
 
+Lazy read-only pmem can be backed by a range service instead of a local file:
+
+```text
+--pmem size=<aligned_size>,data_size=<image_size>,id=<device_id>,\
+        discard_writes=on,lazy=on,backend_id=<content_id>,\
+        socket=<backend_socket_path>
+```
+
+In this mode `file` must not be specified. The pmem host mapping is initially
+anonymous and missing pages are resolved from an external range backend through
+userfaultfd. `size` must be non-zero and 2 MiB aligned, while `data_size` must
+be in `(0, size]`. `backend_id` is opaque to Cloud Hypervisor. Data-plane or mapping failures stop the VM instead of
+silently replacing image data with zeroes. File-backed pmem behavior is
+unchanged when `lazy` is disabled.
+
 ### virtio-rng
 
 A VM does not generate entropy like a real machine would, which is an issue
